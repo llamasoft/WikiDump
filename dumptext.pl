@@ -4,14 +4,14 @@ use strict;
 use warnings;
 no  warnings 'utf8';
 
-use Getopt::Long qw{ :config auto_help };
+use Getopt::Long;
 use Pod::Usage;
 use Data::Dumper;
 
 use threads;
 use threads::shared;
 use Thread::Queue;
-use Time::HiRes;
+use Time::HiRes qw{ usleep };
 
 use Encode;
 use HTML::Entities;
@@ -41,21 +41,22 @@ if ( !defined($xml_name) || length($xml_name) == 0 ) {
 }
 
 
-# If no filtering options were supplied, keep all articles
+# Should we apply filtering?
 if ( scalar(@categories) == 0 && scalar(@transclusions) == 0 ) {
+    # If no filtering options were supplied, keep all articles
     printf(STDERR "No filtering applied, all articles will be kept\n");
     $keep_all = 1;
 
 } else {
     # Otherwise, convert transclusions and categories to static regular expressions
     if ( scalar(@categories) > 0 ) {
-        printf(STDERR 'Including categories: "%s"\n', join('", "', @categories));
+        printf(STDERR "Including categories: \"%s\"\n", join('", "', @categories));
         @categories = map { qr/\Q$_\E/i; } @categories;
     }
 
     if ( scalar(@transclusions) > 0 ) {
-        printf(STDERR 'Including transclusions: "%s"\n', join('", "', @transclusions));
-        @categories = map { qr/\Q$_\E/i; } @transclusions;
+        printf(STDERR "Including transclusions: \"%s\"\n", join('", "', @transclusions));
+        @transclusions = map { qr/\Q$_\E/i; } @transclusions;
     }
 }
 
@@ -71,6 +72,7 @@ my $worker_queue_max = 4 * 1024;
 
 # Our array of workers and worker thread creation
 my @workers = ();
+printf(STDERR "Spawning %d worker threads\n", $worker_count);
 for ( 1 .. $worker_count ) { push(@workers, threads->create(\&worker_thread, $_)); }
 
 
@@ -99,7 +101,7 @@ while( (my $read_bytes = read($xml, $buffer, 64 * 1024, length($buffer))) > 0 ) 
 
         # Yes, I'm parsing XML with Regular Expressions
         # MediaWiki dumps are very clean and even XML::Simple parsing is way slower (20x)
-        # Skip this page unless it has a title, namespace, and text body
+        # Skip this page unless it has a title, namespace, and text body (with content)
         next unless $page =~ m{
             <title>(?'title'.*?)</title> .*?
             <ns>(?'namespace'.*?)</ns>   .*?
@@ -122,23 +124,33 @@ while( (my $read_bytes = read($xml, $buffer, 64 * 1024, length($buffer))) > 0 ) 
         my $keep = $keep_all;
 
         # First check for categories
-        while ( !$keep && $text =~ /\[\[ Category: ([^\]]+) \]\]/xig ) {
-            my $cur_category = $1;
+        if ( scalar(@categories) > 0 ) {
+            pos($text) = 0;
 
-            for my $target_category (@categories) {
-                if ( $cur_category =~ $target_category ) { $keep = 1; last; }
+            while ( !$keep && $text =~ /\[\[ Category: ([^\[\]\n]+) \]\]/xig ) {
+                my $cur_category = $1;
+
+                for my $target_category (@categories) {
+                    if ( $cur_category =~ $target_category ) { $keep = 1; last; }
+                }
             }
         }
 
-        # Then check transclusions
-        while ( !$keep && $text =~ /\{\{ ([^\}]+) \}\}/xig ) {
-            my $cur_transclusion = $1;
-            for my $target_category (@categories) {
-                if ( $cur_transclusion =~ $target_category ) { $keep = 1; last; }
+        # Then check transclusions (but not citations)
+        if ( scalar(@transclusions) > 0 ) {
+            pos($text) = 0;
+
+            while ( !$keep && $text =~ /\{\{ (?!cite) ([^\{\}\n]+) \}\}/xig ) {
+                my $cur_transclusion = $1;
+
+                for my $target_transclusion (@transclusions) {
+                    if ( $cur_transclusion =~ $target_transclusion ) { $keep = 1; last; }
+                }
             }
         }
 
-        if ( $keep == 0 ) { next; }
+        # If we have no reason to keep, skip this article
+        if ( !$keep ) { next; }
         ########################################
 
 
@@ -165,9 +177,13 @@ while( (my $read_bytes = read($xml, $buffer, 64 * 1024, length($buffer))) > 0 ) 
             my $bytes_per_sec = $total_bytes / ( time() - $start_time );
             my $seconds_to_finish = ($xml_bytes - $total_bytes) / $bytes_per_sec;
 
+            # We start to slow down after the first few minutes
+            # Inflate the ETA by a percentage based on our current run time
+            my $error_fudge = 1 + ( 1 / sqrt(time() - $start_time) );
+
             printf(STDERR "    Overall Progress: %.2f%% (ETA %d minutes @ %d MB/s); Current Article: %s\n",
                 100 * $progress_pct,
-                $seconds_to_finish / 60,
+                ($seconds_to_finish / 60) * $error_fudge,
                 $bytes_per_sec / 1024 / 1024,
                 $title
             );
@@ -207,12 +223,6 @@ sub print_queue {
 sub worker_thread {
     my $worker_id = shift(@_);
 
-    {
-        lock($stderr_lock);
-        printf(STDERR "Worker %d started\n", $worker_id);
-        select(STDERR)->flush();
-    }
-
     while ( defined(my $text = $worker_queue->dequeue()) ) {
         # Strip any footers or reference sections
         # The shorter we make the article early on, the faster the processing
@@ -237,7 +247,9 @@ sub worker_thread {
         $text =~ s/<br(?:\s+\/)>/ /g;           # Breaks should at least act as word separators
         $text =~ s/<!--.*?-->//sg;              # HTML <!-- comments -->
 
-        # Remove any HTML tags (nested)
+        # Remove any HTML tags (recursive, inside to out)
+        # Note: ( (?: (?!X) . )*? ) is "everything as long as it doesn't contain X"
+        #   You will see this used to make sure we don't match nested items
         while ( $text =~ s/
             <(\w+) (?:\s [^>]*)? >
             (?:(?!<\1).)*?
@@ -251,14 +263,14 @@ sub worker_thread {
         $text =~ s/'{2,}//g;                    # ''italic'' and '''bold'''
         $text =~ s/={2,}[^=]+={2,}//g;          # Anything in ==Tag== or ===Tags===
 
-        # Remove any transclusions (nested)
+        # Remove any transclusions (recursive, inside to out)
         while ( $text =~ s/
             \{\{
             (?:(?!\{\{).)*?
             \}\}
         //xsg ) { ; }
 
-        # Remove any tables (nested)
+        # Remove any tables (recursive, inside to out)
         while ( $text =~ s/
             \{\|
             (?:(?!\{\|).)*?
@@ -267,7 +279,7 @@ sub worker_thread {
 
 
         # Links and embeds
-        # Parse all "long" links [[text]] (nested)
+        # Parse all "long" links [[text]] (recursive, inside to out)
         while ( $text =~ s/
             \[\[
             ( (?:(?!\[\[).)*? )
