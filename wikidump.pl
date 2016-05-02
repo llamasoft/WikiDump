@@ -223,6 +223,39 @@ sub print_queue {
 sub worker_thread {
     my $worker_id = shift(@_);
 
+    # These are the HTML tags whose content we wish to keep
+    # All other HTML tags and their content will be removed
+    # This list is derived from the following help page:
+    #   https://en.wikipedia.org/wiki/Help:HTML_in_wikitext
+    my $html_keeps = join('|', (
+        # Quotes and blocks
+        'blockquote', 'div', 'span', 'center', 'p',
+
+        # Headings
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+
+        # Code and code-like blocks
+        'pre', 'code', 'syntaxhighlight', 'poem', 'tt',
+
+        # Font size
+        'small', 'big', 'sub', 'sup',
+
+        # Font style
+        'abbr', 'b', 'bdi', 'bdo', 'cite', 'data',
+        'del', 'dfn', 'em', 'font', 'i', 'ins', 'kbd',
+        'mark', 'q', 's', 'samp', 'strike', 'strong',
+        'time', 'u', 'var', 'wbr',
+
+        # List elements
+        'dl', 'dt', 'dd', 'ol', 'ul', 'li',
+
+        # Table elements
+        'table', 'td', 'tr', 'th',
+        'thead', 'tfoot', 'tbody', 'caption'
+    ));
+    $html_keeps = qr{$html_keeps}i;
+
+
     while ( defined(my $text = $worker_queue->dequeue()) ) {
         # Strip any footers or reference sections
         # The shorter we make the article early on, the faster the processing
@@ -231,11 +264,12 @@ sub worker_thread {
             .*$
         //xsi;
 
-        # We've lied to perl so far about this article body being ASCII, not UTF-8
-        # At this point we need to convert to UTF-8 so decode_entities() doesn't barf
-        # Because we're handling UTF-8 on our own, setting binmode(STDOUT, ':utf8')
-        #   results in double-encoded UTF-8 values, so we opt to never set it
-        $text =  decode("UTF-8", $text);
+        # We've lied to perl so far about this article body being ASCII, because it's actually UTF-8
+        # We convert to UTF-8 so decode_entities() doesn't mix encodings if it decodes a UTF-8 entitiy like &egrave;
+        # After the decode, the $text will use perl's internal UTF-8 representation (each Unicode character
+        #   will be a single character with an ord() value allowed to go over 256)
+        # We will re-encode this before placing it in the result queue
+        $text = decode("UTF-8", $text);
 
         # Miscellaneous markdown and HTML cleanup
         $text =  decode_entities($text);        # Decode because of embedding in XML (e.g. &lt; &gt; &amp;)
@@ -247,9 +281,21 @@ sub worker_thread {
         $text =~ s/<br(?:\s+\/)>/ /g;           # Breaks should at least act as word separators
         $text =~ s/<!--.*?-->//sg;              # HTML <!-- comments -->
 
-        # Remove any HTML tags (recursive, inside to out)
+        # Convert back to multibyte UTF-8 instead of perl's internal representation
+        # The regex engine is a good bit faster when each character's ord() is under 256
+        $text = encode("UTF-8", $text);
+
+
+        # There are a few HTML tags whose content we want to keep (recursive, inside to out)
         # Note: ( (?: (?!X) . )*? ) is "everything as long as it doesn't contain X"
         #   You will see this used to make sure we don't match nested items
+        while ( $str =~ s/
+            <($html_keeps) (?:\s [^>]*)? >
+            ( (?:(?!<\1).)*? )
+            <\/\1>
+        /$2/xsig ) { ; }
+
+        # Remove any remaining HTML tags
         while ( $text =~ s/
             <(\w+) (?:\s [^>]*)? >
             (?:(?!<\1).)*?
