@@ -274,11 +274,13 @@ sub worker_thread {
         # Miscellaneous markdown and HTML cleanup
         $text =  decode_entities($text);        # Decode because of embedding in XML (e.g. &lt; &gt; &amp;)
         $text =~ s/&(?:nb|thin)sp;/ /g;         # iconv doesn't transliterate non-breaking spaces very well
+        $text =~ s/&shy;//g;                    # Soft hyphens are invisible and break things
         $text =~ s/&[mn]dash;/ - /g;            # mdash and ndash need to work like word breaks
         $text =~ s/&hellip;/... /g;             # Ellipsis need to act like word breaks as well
+        $text =~ s/(\.{2,})\b(?!\s)/$1 /g;      # Any series of ellipsis should have a space afterwards
         $text =  decode_entities($text);        # Decode again because of actual entities (e.g. &omega;)
         $text =~ s/&[A-Za-z0-9]+;//g;           # Unconverted HTML entities (?)
-        $text =~ s/<br(?:\s+\/)>/ /g;           # Breaks should at least act as word separators
+        $text =~ s/<[bh]r(?:\s+\/)>/ /g;        # Breaks should at least act as word separators
         $text =~ s/<!--.*?-->//sg;              # HTML <!-- comments -->
 
         # Convert back to multibyte UTF-8 instead of perl's internal representation
@@ -289,7 +291,7 @@ sub worker_thread {
         # There are a few HTML tags whose content we want to keep (recursive, inside to out)
         # Note: ( (?: (?!X) . )*? ) is "everything as long as it doesn't contain X"
         #   You will see this used to make sure we don't match nested items
-        while ( $str =~ s/
+        while ( $text =~ s/
             <($html_keeps) (?:\s [^>]*)? >
             ( (?:(?!<\1).)*? )
             <\/\1>
@@ -355,9 +357,13 @@ sub parse_long_link {
     # They always start with an uppercase letter and won't have a space after the colon
     if ( $link_body =~ /^[A-Z]\w+:\S/ ) { return ""; }
 
+    # Intra-article header links are blanked
+    if ( $link_body =~ /^#/ ) { return ""; }
+
     # Links to translated versions of articles always start with lang:Article Name
+    # The exception to this is "w:" which is a dummy entry for pipe tricks
     # Keep everything after the first colon
-    if ( $link_body =~ /^[a-z]+:\S/ ) {
+    if ( $link_body =~ /^[a-z]+:\S/ && $link_body !~ /^w:/ ) {
         my @link_parts = split(/\Q:\E/, $link_body, 2);
         return pop(@link_parts);
     }
@@ -389,23 +395,24 @@ B<wikidump.pl> B<--xml> F<path/to/dump.xml> [B<--workers> N] [B<--categories> ..
 Parsed articles are written to STDOUT, status updates are written to STDERR.
 Filtering can be applied to include only certain articles.  If no filtering options are specified, all articles are kept.
 
+
 B<Options>
 
 =over 4
 
-=item B<--xml>
+=item B<--xml>, B<-x>
 
 The MediaWiki XML dump to process, this option is required
 
-=item B<--workers>
+=item B<--workers>, B<-w>
 
 The number of worker threads to spawn (default 2)
 
-=item B<--categories>
+=item B<--categories>, B<-c>
 
 Articles whose categores contain any of these entries will be kept
 
-=item B<--transclusions>
+=item B<--transclusions>, B<-t>
 
 Articles whose transclusions contain any of these entires will be kept
 
@@ -414,6 +421,7 @@ Articles whose transclusions contain any of these entires will be kept
 Displays a full help guide including additional parameter details
 
 =back
+
 
 B<Examples>
 
